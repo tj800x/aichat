@@ -231,33 +231,30 @@ impl Config {
 
         if let Some(session) = input.session_mut(&mut self.session) {
             session.add_message(&input, output)?;
+            self.write_message_to_file(&input, output)?;
             return Ok(());
         }
-
-        if !self.save {
+        self.write_message_to_file(&input, output)?;
+        return Ok(());
+    
+    
+    }
+    fn write_message_to_file(&self, input: &Input, output: &str) -> Result<()> {
+        if !self.save || output.is_empty() {
             return Ok(());
         }
         let mut file = self.open_message_file()?;
-        if output.is_empty() || !self.save {
-            return Ok(());
-        }
         let timestamp = now();
         let summary = input.summary();
         let input_markdown = input.render();
-        let output = match input.role() {
-            None => {
-                format!("# CHAT: {summary} [{timestamp}]\n{input_markdown}\n--------\n{output}\n--------\n\n",)
-            }
-            Some(v) => {
-                format!(
-                    "# CHAT: {summary} [{timestamp}] ({})\n{input_markdown}\n--------\n{output}\n--------\n\n",
-                    v.name,
-                )
-            }
+        let output_formatted = match input.role() {
+            None => format!("# CHAT: {summary} [{timestamp}]\n{input_markdown}\n--------\n{output}\n--------\n\n"),
+            Some(v) => format!("# CHAT: {summary} [{timestamp}] ({})\n{input_markdown}\n--------\n{output}\n--------\n\n", v.name),
         };
-        file.write_all(output.as_bytes())
+        file.write_all(output_formatted.as_bytes())
             .with_context(|| "Failed to save message")
     }
+
 
     pub fn maybe_copy(&self, text: &str) {
         if self.auto_copy {
