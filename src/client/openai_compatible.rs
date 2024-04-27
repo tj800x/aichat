@@ -4,7 +4,6 @@ use super::{ExtraConfig, Model, ModelConfig, OpenAICompatibleClient, PromptType,
 use crate::utils::PromptKind;
 
 use anyhow::Result;
-use async_trait::async_trait;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 
@@ -18,9 +17,8 @@ pub struct OpenAICompatibleConfig {
     pub extra: Option<ExtraConfig>,
 }
 
-openai_compatible_client!(OpenAICompatibleClient);
-
 impl OpenAICompatibleClient {
+    list_models_fn!(OpenAICompatibleConfig);
     config_get_fn!(api_key, get_api_key);
 
     pub const PROMPTS: [PromptType<'static>; 5] = [
@@ -36,25 +34,10 @@ impl OpenAICompatibleClient {
         ),
     ];
 
-    pub fn list_models(local_config: &OpenAICompatibleConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-
-        local_config
-            .models
-            .iter()
-            .map(|v| {
-                Model::new(client_name, &v.name)
-                    .set_capabilities(v.capabilities)
-                    .set_max_input_tokens(v.max_input_tokens)
-                    .set_extra_fields(v.extra_fields.clone())
-            })
-            .collect()
-    }
-
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
         let api_key = self.get_api_key().ok();
 
-        let mut body = openai_build_body(data, self.model.name.clone());
+        let mut body = openai_build_body(data, &self.model);
         self.model.merge_extra_fields(&mut body);
 
         let chat_endpoint = self
@@ -75,3 +58,9 @@ impl OpenAICompatibleClient {
         Ok(builder)
     }
 }
+
+impl_client_trait!(
+    OpenAICompatibleClient,
+    crate::client::openai::openai_send_message,
+    crate::client::openai::openai_send_message_streaming
+);

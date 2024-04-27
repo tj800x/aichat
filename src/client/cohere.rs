@@ -1,73 +1,44 @@
 use super::{
-    json_stream, message::*, patch_system_message, Client, CohereClient, ExtraConfig, Model,
-    PromptType, SendData,
+    catch_error, extract_system_message, json_stream, message::*, CohereClient,
+    ExtraConfig, Model, ModelConfig, PromptType, ReplyHandler, SendData,
 };
 
-use crate::{render::ReplyHandler, utils::PromptKind};
+use crate::utils::PromptKind;
 
 use anyhow::{bail, Result};
-use async_trait::async_trait;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use serde::Deserialize;
 use serde_json::{json, Value};
 
 const API_URL: &str = "https://api.cohere.ai/v1/chat";
 
-const MODELS: [(&str, usize, &str); 2] = [
-    // https://docs.cohere.com/docs/command-r
-    ("command-r", 128000, "text"),
-    ("command-r-plus", 128000, "text"),
-];
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct CohereConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
 }
 
-#[async_trait]
-impl Client for CohereClient {
-    client_common_fns!();
-
-    async fn send_message_inner(&self, client: &ReqwestClient, data: SendData) -> Result<String> {
-        let builder = self.request_builder(client, data)?;
-        send_message(builder).await
-    }
-
-    async fn send_message_streaming_inner(
-        &self,
-        client: &ReqwestClient,
-        handler: &mut ReplyHandler,
-        data: SendData,
-    ) -> Result<()> {
-        let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler).await
-    }
-}
-
 impl CohereClient {
+    list_models_fn!(
+        CohereConfig,
+        [
+            // https://docs.cohere.com/docs/command-r
+            ("command-r", "text", 128000),
+            ("command-r-plus", "text", 128000),
+        ]
+    );
     config_get_fn!(api_key, get_api_key);
 
     pub const PROMPTS: [PromptType<'static>; 1] =
         [("api_key", "API Key:", false, PromptKind::String)];
 
-    pub fn list_models(local_config: &CohereConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, max_input_tokens, capabilities)| {
-                Model::new(client_name, name)
-                    .set_capabilities(capabilities.into())
-                    .set_max_input_tokens(Some(max_input_tokens))
-            })
-            .collect()
-    }
-
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
         let api_key = self.get_api_key().ok();
 
-        let body = build_body(data, self.model.name.clone())?;
+        let body = build_body(data, &self.model)?;
 
         let url = API_URL;
 
@@ -82,25 +53,25 @@ impl CohereClient {
     }
 }
 
-pub(crate) async fn send_message(builder: RequestBuilder) -> Result<String> {
+impl_client_trait!(CohereClient, send_message, send_message_streaming);
+
+async fn send_message(builder: RequestBuilder) -> Result<String> {
     let res = builder.send().await?;
     let status = res.status();
     let data: Value = res.json().await?;
     if status != 200 {
-        check_error(&data)?;
+        catch_error(&data, status.as_u16())?;
     }
     let output = extract_text(&data)?;
     Ok(output.to_string())
 }
 
-pub(crate) async fn send_message_streaming(
-    builder: RequestBuilder,
-    handler: &mut ReplyHandler,
-) -> Result<()> {
+async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHandler) -> Result<()> {
     let res = builder.send().await?;
-    if res.status() != 200 {
+    let status = res.status();
+    if status != 200 {
         let data: Value = res.json().await?;
-        check_error(&data)?;
+        catch_error(&data, status.as_u16())?;
     } else {
         let handle = |value: &str| -> Result<()> {
             let value: Value = serde_json::from_str(value)?;
@@ -114,31 +85,15 @@ pub(crate) async fn send_message_streaming(
     Ok(())
 }
 
-fn extract_text(data: &Value) -> Result<&str> {
-    match data["text"].as_str() {
-        Some(text) => Ok(text),
-        None => {
-            bail!("Invalid response data: {data}")
-        }
-    }
-}
-
-fn check_error(data: &Value) -> Result<()> {
-    if let Some(message) = data["message"].as_str() {
-        bail!("{message}");
-    } else {
-        bail!("Error {}", data);
-    }
-}
-
-pub(crate) fn build_body(data: SendData, model: String) -> Result<Value> {
+fn build_body(data: SendData, model: &Model) -> Result<Value> {
     let SendData {
         mut messages,
         temperature,
+        top_p,
         stream,
     } = data;
 
-    patch_system_message(&mut messages);
+    let system_message = extract_system_message(&mut messages);
 
     let mut image_urls = vec![];
     let mut messages: Vec<Value> = messages
@@ -179,20 +134,39 @@ pub(crate) fn build_body(data: SendData, model: String) -> Result<Value> {
     let message = message["message"].as_str().unwrap_or_default();
 
     let mut body = json!({
-        "model": model,
+        "model": &model.name,
         "message": message,
     });
+
+    if let Some(v) = system_message {
+        body["preamble"] = v.into();
+    }
 
     if !messages.is_empty() {
         body["chat_history"] = messages.into();
     }
 
-    if let Some(temperature) = temperature {
-        body["temperature"] = temperature.into();
+    if let Some(v) = model.max_output_tokens {
+        body["max_tokens"] = v.into();
+    }
+    if let Some(v) = temperature {
+        body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["p"] = v.into();
     }
     if stream {
         body["stream"] = true.into();
     }
 
     Ok(body)
+}
+
+fn extract_text(data: &Value) -> Result<&str> {
+    match data["text"].as_str() {
+        Some(text) => Ok(text),
+        None => {
+            bail!("Invalid response data: {data}")
+        }
+    }
 }

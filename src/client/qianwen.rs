@@ -1,11 +1,9 @@
 use super::{
-    message::*, Client, ExtraConfig, Model, PromptType, QianwenClient, SendData,
+    maybe_catch_error, message::*, Client, ExtraConfig, Model, ModelConfig, PromptType,
+    QianwenClient, ReplyHandler, SendData,
 };
 
-use crate::{
-    render::ReplyHandler,
-    utils::{sha256sum, PromptKind},
-};
+use crate::utils::{sha256sum, PromptKind};
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
@@ -26,69 +24,33 @@ const API_URL: &str =
 const API_URL_VL: &str =
     "https://dashscope.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation";
 
-const MODELS: [(&str, usize, &str); 6] = [
-    // https://help.aliyun.com/zh/dashscope/developer-reference/api-details
-    ("qwen-turbo", 6000, "text"),
-    ("qwen-plus", 30000, "text"),
-    ("qwen-max", 6000, "text"),
-    ("qwen-max-longcontext", 28000, "text"),
-    // https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-qianwen-vl-plus-api
-    ("qwen-vl-plus", 0, "text,vision"),
-    ("qwen-vl-max", 0, "text,vision"),
-];
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct QianwenConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
 }
 
-#[async_trait]
-impl Client for QianwenClient {
-    client_common_fns!();
-
-    async fn send_message_inner(
-        &self,
-        client: &ReqwestClient,
-        mut data: SendData,
-    ) -> Result<String> {
-        let api_key = self.get_api_key()?;
-        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
-        let builder = self.request_builder(client, data)?;
-        send_message(builder, self.is_vl()).await
-    }
-
-    async fn send_message_streaming_inner(
-        &self,
-        client: &ReqwestClient,
-        handler: &mut ReplyHandler,
-        mut data: SendData,
-    ) -> Result<()> {
-        let api_key = self.get_api_key()?;
-        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
-        let builder = self.request_builder(client, data)?;
-        send_message_streaming(builder, handler, self.is_vl()).await
-    }
-}
-
 impl QianwenClient {
+    list_models_fn!(
+        QianwenConfig,
+        [
+            // https://help.aliyun.com/zh/dashscope/developer-reference/api-details
+            ("qwen-turbo", "text", 6000),
+            ("qwen-plus", "text", 30000),
+            ("qwen-max", "text", 6000),
+            ("qwen-max-longcontext", "text", 28000),
+            // https://help.aliyun.com/zh/dashscope/developer-reference/tongyi-qianwen-vl-plus-api
+            ("qwen-vl-plus", "text,vision", 0),
+            ("qwen-vl-max", "text,vision", 0),
+        ]
+    );
     config_get_fn!(api_key, get_api_key);
 
     pub const PROMPTS: [PromptType<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
-
-    pub fn list_models(local_config: &QianwenConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, max_input_tokens, capabilities)| {
-                Model::new(client_name, name)
-                    .set_capabilities(capabilities.into())
-                    .set_max_input_tokens(Some(max_input_tokens))
-            })
-            .collect()
-    }
 
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
         let api_key = self.get_api_key()?;
@@ -100,7 +62,7 @@ impl QianwenClient {
             true => API_URL_VL,
             false => API_URL,
         };
-        let (body, has_upload) = build_body(data, self.model.name.clone(), is_vl)?;
+        let (body, has_upload) = build_body(data, &self.model, is_vl)?;
 
         debug!("Qianwen Request: {url} {body}");
 
@@ -122,7 +84,7 @@ impl QianwenClient {
 
 async fn send_message(builder: RequestBuilder, is_vl: bool) -> Result<String> {
     let data: Value = builder.send().await?.json().await?;
-    check_error(&data)?;
+    maybe_catch_error(&data)?;
 
     let output = if is_vl {
         data["output"]["choices"][0]["message"]["content"][0]["text"].as_str()
@@ -141,21 +103,18 @@ async fn send_message_streaming(
     is_vl: bool,
 ) -> Result<()> {
     let mut es = builder.eventsource()?;
-    let mut offset = 0;
 
     while let Some(event) = es.next().await {
         match event {
             Ok(Event::Open) => {}
             Ok(Event::Message(message)) => {
                 let data: Value = serde_json::from_str(&message.data)?;
-                check_error(&data)?;
+                maybe_catch_error(&data)?;
                 if is_vl {
-                    let text =
-                        data["output"]["choices"][0]["message"]["content"][0]["text"].as_str();
-                    if let Some(text) = text {
-                        let text = &text[offset..];
+                    if let Some(text) =
+                        data["output"]["choices"][0]["message"]["content"][0]["text"].as_str()
+                    {
                         handler.text(text)?;
-                        offset += text.len();
                     }
                 } else if let Some(text) = data["output"]["text"].as_str() {
                     handler.text(text)?;
@@ -176,22 +135,16 @@ async fn send_message_streaming(
     Ok(())
 }
 
-fn check_error(data: &Value) -> Result<()> {
-    if let (Some(code), Some(message)) = (data["code"].as_str(), data["message"].as_str()) {
-        bail!("{code}: {message}");
-    }
-    Ok(())
-}
-
-fn build_body(data: SendData, model: String, is_vl: bool) -> Result<(Value, bool)> {
+fn build_body(data: SendData, model: &Model, is_vl: bool) -> Result<(Value, bool)> {
     let SendData {
         messages,
         temperature,
+        top_p,
         stream,
     } = data;
 
     let mut has_upload = false;
-    let (input, parameters) = if is_vl {
+    let input = if is_vl {
         let messages: Vec<Value> = messages
             .into_iter()
             .map(|message| {
@@ -217,36 +170,36 @@ fn build_body(data: SendData, model: String, is_vl: bool) -> Result<(Value, bool
             })
             .collect();
 
-        let input = json!({
+        json!({
             "messages": messages,
-        });
-
-        let mut parameters = json!({});
-        if let Some(v) = temperature {
-            parameters["temperature"] = v.into();
-        }
-        (input, parameters)
+        })
     } else {
-        let input = json!({
+        json!({
             "messages": messages,
-        });
-
-        let mut parameters = json!({});
-        if stream {
-            parameters["incremental_output"] = true.into();
-        }
-
-        if let Some(v) = temperature {
-            parameters["temperature"] = v.into();
-        }
-        (input, parameters)
+        })
     };
 
+    let mut parameters = json!({});
+    if stream {
+        parameters["incremental_output"] = true.into();
+    }
+
+    if let Some(v) = model.max_output_tokens {
+        parameters["max_tokens"] = v.into();
+    }
+    if let Some(v) = temperature {
+        parameters["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        parameters["top_p"] = v.into();
+    }
+
     let body = json!({
-        "model": model,
+        "model": &model.name,
         "input": input,
         "parameters": parameters
     });
+
     Ok((body, has_upload))
 }
 
@@ -339,7 +292,35 @@ async fn upload(model: &str, api_key: &str, url: &str) -> Result<String> {
     let status = res.status();
     if res.status() != 200 {
         let text = res.text().await?;
-        bail!("{status}, {text}")
+        bail!("Invalid response data: {text} (status: {status})")
     }
     Ok(format!("oss://{key}"))
+}
+
+#[async_trait]
+impl Client for QianwenClient {
+    client_common_fns!();
+
+    async fn send_message_inner(
+        &self,
+        client: &ReqwestClient,
+        mut data: SendData,
+    ) -> Result<String> {
+        let api_key = self.get_api_key()?;
+        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
+        let builder = self.request_builder(client, data)?;
+        send_message(builder, self.is_vl()).await
+    }
+
+    async fn send_message_streaming_inner(
+        &self,
+        client: &ReqwestClient,
+        handler: &mut ReplyHandler,
+        mut data: SendData,
+    ) -> Result<()> {
+        let api_key = self.get_api_key()?;
+        patch_messages(&self.model.name, &api_key, &mut data.messages).await?;
+        let builder = self.request_builder(client, data)?;
+        send_message_streaming(builder, handler, self.is_vl()).await
+    }
 }

@@ -41,63 +41,48 @@ const SESSIONS_DIR_NAME: &str = "sessions";
 
 const CLIENTS_FIELD: &str = "clients";
 
+const SUMMARIZE_PROMPT: &str =
+    "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.";
+const SUMMARY_PROMPT: &str = "This is a summary of the chat history as a recap: ";
+const LEFT_PROMPT: &str = "{color.green}{?session {session}{?role /}}{role}{color.cyan}{?session )}{!session >}{color.reset} ";
+const RIGHT_PROMPT: &str = "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}";
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct Config {
-    /// LLM model
     #[serde(rename(serialize = "model", deserialize = "model"))]
     pub model_id: Option<String>,
-    /// LLM temperature
     pub temperature: Option<f64>,
-    /// Dry-run flag
+    pub top_p: Option<f64>,
     pub dry_run: bool,
-    /// Whether to save the message
     pub save: bool,
-    /// Whether to save the session
     pub save_session: Option<bool>,
-    /// Whether to disable highlight
     pub highlight: bool,
-    /// Whether to use a light theme
     pub light_theme: bool,
-    /// Specify the text-wrapping mode (no, auto, <max-width>)
     pub wrap: Option<String>,
-    /// Whether wrap code block
     pub wrap_code: bool,
-    /// Whether to exit REPL when Ctrl+C is pressed
-    pub ctrlc_exit: bool,
-    /// Automatically copy the last output to the clipboard
     pub auto_copy: bool,
-    /// REPL keybindings. (emacs, vi)
     pub keybindings: Keybindings,
-    /// Set a default role or session (role:<name>, session:<name>)
-    pub prelude: String,
-    /// Compress session if tokens exceed this value (>=1000)
+    pub prelude: Option<String>,
+    pub buffer_editor: Option<String>,
     pub compress_threshold: usize,
-    /// The prompt for summarizing session messages
-    pub summarize_prompt: String,
-    // The prompt for the summary of the session
-    pub summary_prompt: String,
-    /// REPL left prompt
-    pub left_prompt: String,
-    /// REPL right prompt
-    pub right_prompt: String,
-    /// Setup clients
+    pub summarize_prompt: Option<String>,
+    pub summary_prompt: Option<String>,
+    pub left_prompt: Option<String>,
+    pub right_prompt: Option<String>,
     pub clients: Vec<ClientConfig>,
-    /// Predefined roles
     #[serde(skip)]
     pub roles: Vec<Role>,
-    /// Current selected role
     #[serde(skip)]
     pub role: Option<Role>,
-    /// Current session
     #[serde(skip)]
     pub session: Option<Session>,
     #[serde(skip)]
     pub model: Model,
     #[serde(skip)]
-    pub last_message: Option<(Input, String)>,
+    pub working_mode: WorkingMode,
     #[serde(skip)]
-    pub in_repl: bool,
+    pub last_message: Option<(Input, String)>,
 }
 
 impl Default for Config {
@@ -105,6 +90,7 @@ impl Default for Config {
         Self {
             model_id: None,
             temperature: None,
+            top_p: None,
             save: true,
             save_session: None,
             highlight: true,
@@ -112,23 +98,22 @@ impl Default for Config {
             light_theme: false,
             wrap: None,
             wrap_code: false,
-            ctrlc_exit: false,
             auto_copy: false,
             keybindings: Default::default(),
-            prelude: String::new(),
+            prelude: None,
+            buffer_editor: None,
             compress_threshold: 2000,
-            summarize_prompt: "Summarize the discussion briefly in 200 words or less to use as a prompt for future context.".to_string(),
-            summary_prompt: "This is a summary of the chat history as a recap: ".into(),
-            left_prompt: "{color.green}{?session {session}{?role /}}{role}{color.cyan}{?session )}{!session >}{color.reset} ".to_string(),
-            right_prompt: "{color.purple}{?session {?consume_tokens {consume_tokens}({consume_percent}%)}{!consume_tokens {consume_tokens}}}{color.reset}"
-                .to_string(),
-            clients: vec![ClientConfig::default()],
+            summarize_prompt: None,
+            summary_prompt: None,
+            left_prompt: None,
+            right_prompt: None,
+            clients: vec![],
             roles: vec![],
             role: None,
             session: None,
             model: Default::default(),
+            working_mode: WorkingMode::Command,
             last_message: None,
-            in_repl: false,
         }
     }
 }
@@ -136,13 +121,13 @@ impl Default for Config {
 pub type GlobalConfig = Arc<RwLock<Config>>;
 
 impl Config {
-    pub fn init(is_interactive: bool) -> Result<Self> {
+    pub fn init(working_mode: WorkingMode) -> Result<Self> {
         let config_path = Self::config_file()?;
 
         let api_key = env::var("OPENAI_API_KEY").ok();
 
         let exist_config_path = config_path.exists();
-        if is_interactive && api_key.is_none() && !exist_config_path {
+        if working_mode != WorkingMode::Command && api_key.is_none() && !exist_config_path {
             create_config_file(&config_path)?;
         }
         let mut config = if api_key.is_some() && !exist_config_path {
@@ -160,19 +145,21 @@ impl Config {
             config.set_wrap(&wrap)?;
         }
 
+        config.working_mode = working_mode;
         config.load_roles()?;
 
         config.setup_model()?;
         config.setup_highlight();
         config.setup_light_theme()?;
 
-        setup_logger()?;
-
         Ok(config)
     }
 
-    pub fn prelude(&mut self) -> Result<()> {
-        let prelude = self.prelude.clone();
+    pub fn apply_prelude(&mut self) -> Result<()> {
+        let prelude = self.prelude.clone().unwrap_or_default();
+        if prelude.is_empty() {
+            return Ok(());
+        }
         let err_msg = || format!("Invalid prelude '{}", prelude);
         match prelude.split_once(':') {
             Some(("role", name)) => {
@@ -185,12 +172,17 @@ impl Config {
                     self.start_session(Some(name)).with_context(err_msg)?;
                 }
             }
-            Some(_) => {
+            _ => {
                 bail!("{}", err_msg())
             }
-            None => {}
         }
         Ok(())
+    }
+
+    pub fn buffer_editor(&self) -> Option<String> {
+        self.buffer_editor
+            .clone()
+            .or_else(|| env::var("VISUAL").ok().or_else(|| env::var("EDITOR").ok()))
     }
 
     pub fn retrieve_role(&self, name: &str) -> Result<Role> {
@@ -290,6 +282,11 @@ impl Config {
         Ok(path)
     }
 
+    pub fn set_prompt(&mut self, prompt: &str) -> Result<()> {
+        let role = Role::temp(prompt);
+        self.set_role_obj(role)
+    }
+
     pub fn set_role(&mut self, name: &str) -> Result<()> {
         let role = self.retrieve_role(name)?;
         self.set_role_obj(role)
@@ -299,6 +296,7 @@ impl Config {
         if let Some(session) = self.session.as_mut() {
             session.guard_empty()?;
             session.set_temperature(role.temperature);
+            session.set_top_p(role.top_p);
         }
         self.role = Some(role);
         Ok(())
@@ -334,6 +332,16 @@ impl Config {
             role.set_temperature(value);
         } else {
             self.temperature = value;
+        }
+    }
+
+    pub fn set_top_p(&mut self, value: Option<f64>) {
+        if let Some(session) = self.session.as_mut() {
+            session.set_top_p(value);
+        } else if let Some(role) = self.role.as_mut() {
+            role.set_top_p(value);
+        } else {
+            self.top_p = value;
         }
     }
 
@@ -410,14 +418,10 @@ impl Config {
             .wrap
             .clone()
             .map_or_else(|| String::from("no"), |v| v.to_string());
-        let prelude = if self.prelude.is_empty() {
-            String::from("-")
-        } else {
-            self.prelude.clone()
-        };
         let items = vec![
             ("model", self.model.id()),
             ("temperature", format_option(&self.temperature)),
+            ("top_p", format_option(&self.top_p)),
             ("dry_run", self.dry_run.to_string()),
             ("save", self.save.to_string()),
             ("save_session", format_option(&self.save_session)),
@@ -427,7 +431,7 @@ impl Config {
             ("wrap_code", self.wrap_code.to_string()),
             ("auto_copy", self.auto_copy.to_string()),
             ("keybindings", self.keybindings.stringify().into()),
-            ("prelude", prelude),
+            ("prelude", format_option(&self.prelude)),
             ("compress_threshold", self.compress_threshold.to_string()),
             ("config_file", display_path(&Self::config_file()?)),
             ("roles_file", display_path(&Self::roles_file()?)),
@@ -485,6 +489,7 @@ impl Config {
                 ".session" => self.list_sessions(),
                 ".set" => vec![
                     "temperature ",
+                    "top_p ",
                     "compress_threshold",
                     "save ",
                     "save_session ",
@@ -535,6 +540,10 @@ impl Config {
             "temperature" => {
                 let value = parse_value(value)?;
                 self.set_temperature(value);
+            }
+            "top_p" => {
+                let value = parse_value(value)?;
+                self.set_top_p(value);
             }
             "compress_threshold" => {
                 let value = parse_value(value)?;
@@ -617,7 +626,7 @@ impl Config {
             let save_session = session.save_session();
             if session.dirty && save_session != Some(false) {
                 if save_session.is_none() || session.is_temp() {
-                    if !self.in_repl {
+                    if self.working_mode != WorkingMode::Repl {
                         return Ok(());
                     }
                     let ans = Confirm::new("Save session?").with_default(false).prompt()?;
@@ -688,8 +697,13 @@ impl Config {
 
     pub fn compress_session(&mut self, summary: &str) {
         if let Some(session) = self.session.as_mut() {
-            session.compress(format!("{}{}", self.summary_prompt, summary));
+            let summary_prompt = self.summary_prompt.as_deref().unwrap_or(SUMMARY_PROMPT);
+            session.compress(format!("{}{}", summary_prompt, summary));
         }
+    }
+
+    pub fn summarize_prompt(&self) -> &str {
+        self.summarize_prompt.as_deref().unwrap_or(SUMMARIZE_PROMPT)
     }
 
     pub fn is_compressing_session(&self) -> bool {
@@ -739,12 +753,14 @@ impl Config {
 
     pub fn render_prompt_left(&self) -> String {
         let variables = self.generate_prompt_context();
-        render_prompt(&self.left_prompt, &variables)
+        let left_prompt = self.left_prompt.as_deref().unwrap_or(LEFT_PROMPT);
+        render_prompt(left_prompt, &variables)
     }
 
     pub fn render_prompt_right(&self) -> String {
         let variables = self.generate_prompt_context();
-        render_prompt(&self.right_prompt, &variables)
+        let right_prompt = self.right_prompt.as_deref().unwrap_or(RIGHT_PROMPT);
+        render_prompt(right_prompt, &variables)
     }
 
     pub fn prepare_send_data(&self, input: &Input, stream: bool) -> Result<SendData> {
@@ -756,10 +772,18 @@ impl Config {
         } else {
             self.temperature
         };
+        let top_p = if let Some(session) = input.session(&self.session) {
+            session.top_p()
+        } else if let Some(role) = input.role() {
+            role.top_p
+        } else {
+            self.top_p
+        };
         self.model.max_input_tokens_limit(&messages)?;
         Ok(SendData {
             messages,
             temperature,
+            top_p,
             stream,
         })
     }
@@ -789,6 +813,11 @@ impl Config {
         if let Some(temperature) = self.temperature {
             if temperature != 0.0 {
                 output.insert("temperature", temperature.to_string());
+            }
+        }
+        if let Some(top_p) = self.top_p {
+            if top_p != 0.0 {
+                output.insert("top_p", top_p.to_string());
             }
         }
         if self.dry_run {
@@ -951,7 +980,7 @@ impl Config {
             }
         }
 
-        if let Some(ClientConfig::OpenAIConfig(client_config)) = self.clients.get_mut(0) {
+        if let Some(ClientConfig::OpenAIConfig(client_config)) = self.clients.first_mut() {
             if let Some(api_key) = value.get("api_key").and_then(|v| v.as_str()) {
                 client_config.api_key = Some(api_key.to_string())
             }
@@ -995,6 +1024,13 @@ impl Keybindings {
             Keybindings::Vi => "vi",
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum WorkingMode {
+    Command,
+    Repl,
+    Serve,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -1143,26 +1179,4 @@ fn complete_option_bool(value: Option<bool>) -> Vec<String> {
         Some(false) => vec!["true".to_string(), "null".to_string()],
         None => vec!["true".to_string(), "false".to_string()],
     }
-}
-
-#[cfg(debug_assertions)]
-fn setup_logger() -> Result<()> {
-    use simplelog::{LevelFilter, WriteLogger};
-    let file = std::fs::File::create(Config::local_path("debug.log")?)?;
-    let log_filter = match std::env::var("AICHAT_LOG_FILTER") {
-        Ok(v) => v,
-        Err(_) => "aichat".into(),
-    };
-    let config = simplelog::ConfigBuilder::new()
-        .add_filter_allow(log_filter)
-        .set_thread_level(LevelFilter::Off)
-        .set_time_level(LevelFilter::Off)
-        .build();
-    WriteLogger::init(log::LevelFilter::Debug, config, file)?;
-    Ok(())
-}
-
-#[cfg(not(debug_assertions))]
-fn setup_logger() -> Result<()> {
-    Ok(())
 }

@@ -1,53 +1,99 @@
-use super::{patch_system_message, Client, ErnieClient, ExtraConfig, Model, PromptType, SendData};
+use super::{
+    maybe_catch_error, patch_system_message, Client, ErnieClient, ExtraConfig, Model, ModelConfig,
+    PromptType, ReplyHandler, SendData,
+};
 
-use crate::{render::ReplyHandler, utils::PromptKind};
+use crate::utils::PromptKind;
 
 use anyhow::{anyhow, bail, Context, Result};
 use async_trait::async_trait;
+use chrono::Utc;
 use futures_util::StreamExt;
-use lazy_static::lazy_static;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::{env, sync::Mutex};
+use std::env;
 
 const API_BASE: &str = "https://aip.baidubce.com/rpc/2.0/ai_custom/v1";
 const ACCESS_TOKEN_URL: &str = "https://aip.baidubce.com/oauth/2.0/token";
 
-const MODELS: [(&str, usize, &str); 7] = [
-    // https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
-    ("ernie-4.0-8k", 5120, "/wenxinworkshop/chat/completions_pro"),
-    (
-        "ernie-3.5-8k",
-        5120,
-        "/wenxinworkshop/chat/ernie-3.5-8k-0205",
-    ),
-    (
-        "ernie-3.5-4k",
-        2048,
-        "/wenxinworkshop/chat/ernie-3.5-4k-0205",
-    ),
-    ("ernie-speed-8k", 7168, "/wenxinworkshop/chat/ernie_speed"),
-    (
-        "ernie-speed-128k",
-        124000,
-        "/wenxinworkshop/chat/ernie-speed-128k",
-    ),
-    ("ernie-lite-8k", 7168, "/wenxinworkshop/chat/ernie-lite-8k"),
-    ("ernie-tiny-8k", 7168, "/wenxinworkshop/chat/ernie-tiny-8k"),
-];
-
-lazy_static! {
-    static ref ACCESS_TOKEN: Mutex<Option<String>> = Mutex::new(None);
-}
+static mut ACCESS_TOKEN: (String, i64) = (String::new(), 0);
 
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct ErnieConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     pub secret_key: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
+}
+
+impl ErnieClient {
+    list_models_fn!(
+        ErnieConfig,
+        [
+            // https://cloud.baidu.com/doc/WENXINWORKSHOP/s/clntwmv7t
+            ("ernie-4.0-8k", "text", 5120, 2048),
+            ("ernie-3.5-8k", "text", 5120, 2048),
+            ("ernie-3.5-4k", "text", 2048, 2048),
+            ("ernie-speed-8k", "text", 7168, 2048),
+            ("ernie-speed-128k", "text", 124000, 4096),
+            ("ernie-lite-8k", "text", 7168, 2048),
+            ("ernie-tiny-8k", "text", 7168, 2048),
+        ]
+    );
+
+    pub const PROMPTS: [PromptType<'static>; 2] = [
+        ("api_key", "API Key:", true, PromptKind::String),
+        ("secret_key", "Secret Key:", true, PromptKind::String),
+    ];
+
+    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
+        let body = build_body(data, &self.model);
+
+        let endpoint = match self.model.name.as_str() {
+            "ernie-4.0-8k" => "completions_pro",
+            "ernie-3.5-8k" => "ernie-3.5-8k-0205",
+            "ernie-3.5-4k" => "ernie-3.5-4k-0205",
+            "ernie-speed-8k" => "ernie_speed",
+            _ => &self.model.name,
+        };
+
+        let url = format!(
+            "{API_BASE}/wenxinworkshop/chat/{endpoint}?access_token={}",
+            unsafe { &ACCESS_TOKEN.0 }
+        );
+
+        debug!("Ernie Request: {url} {body}");
+
+        let builder = client.post(url).json(&body);
+
+        Ok(builder)
+    }
+
+    async fn prepare_access_token(&self) -> Result<()> {
+        if unsafe { ACCESS_TOKEN.0.is_empty() || Utc::now().timestamp() > ACCESS_TOKEN.1 } {
+            let env_prefix = Self::name(&self.config).to_uppercase();
+            let api_key = self.config.api_key.clone();
+            let api_key = api_key
+                .or_else(|| env::var(format!("{env_prefix}_API_KEY")).ok())
+                .ok_or_else(|| anyhow!("Miss api_key"))?;
+
+            let secret_key = self.config.secret_key.clone();
+            let secret_key = secret_key
+                .or_else(|| env::var(format!("{env_prefix}_SECRET_KEY")).ok())
+                .ok_or_else(|| anyhow!("Miss secret_key"))?;
+
+            let client = self.build_client()?;
+            let token = fetch_access_token(&client, &api_key, &secret_key)
+                .await
+                .with_context(|| "Failed to fetch access token")?;
+            unsafe { ACCESS_TOKEN = (token, 86400) };
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -72,70 +118,9 @@ impl Client for ErnieClient {
     }
 }
 
-impl ErnieClient {
-    pub const PROMPTS: [PromptType<'static>; 2] = [
-        ("api_key", "API Key:", true, PromptKind::String),
-        ("secret_key", "Secret Key:", true, PromptKind::String),
-    ];
-
-    pub fn list_models(local_config: &ErnieConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, _, _)| Model::new(client_name, name)) // ERNIE tokenizer is different from cl100k_base
-            .collect()
-    }
-
-    fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
-        let body = build_body(data, self.model.name.clone());
-
-        let model = self.model.name.clone();
-        let (_, _, chat_endpoint) = MODELS
-            .iter()
-            .find(|(v, _, _)| v == &model)
-            .ok_or_else(|| anyhow!("Miss Model '{}'", self.model.id()))?;
-
-        let access_token = ACCESS_TOKEN
-            .lock()
-            .unwrap()
-            .clone()
-            .ok_or_else(|| anyhow!("Failed to load access token"))?;
-
-        let url = format!("{API_BASE}{chat_endpoint}?access_token={access_token}");
-
-        debug!("Ernie Request: {url} {body}");
-
-        let builder = client.post(url).json(&body);
-
-        Ok(builder)
-    }
-
-    async fn prepare_access_token(&self) -> Result<()> {
-        if ACCESS_TOKEN.lock().unwrap().is_none() {
-            let env_prefix = Self::name(&self.config).to_uppercase();
-            let api_key = self.config.api_key.clone();
-            let api_key = api_key
-                .or_else(|| env::var(format!("{env_prefix}_API_KEY")).ok())
-                .ok_or_else(|| anyhow!("Miss api_key"))?;
-
-            let secret_key = self.config.secret_key.clone();
-            let secret_key = secret_key
-                .or_else(|| env::var(format!("{env_prefix}_SECRET_KEY")).ok())
-                .ok_or_else(|| anyhow!("Miss secret_key"))?;
-
-            let client = self.build_client()?;
-            let token = fetch_access_token(&client, &api_key, &secret_key)
-                .await
-                .with_context(|| "Failed to fetch access token")?;
-            *ACCESS_TOKEN.lock().unwrap() = Some(token);
-        }
-        Ok(())
-    }
-}
-
 async fn send_message(builder: RequestBuilder) -> Result<String> {
     let data: Value = builder.send().await?.json().await?;
-    check_error(&data)?;
+    maybe_catch_error(&data)?;
 
     let output = data["result"]
         .as_str()
@@ -163,8 +148,8 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHand
                             .map_err(|_| anyhow!("Invalid response header"))?;
                         if content_type.contains("application/json") {
                             let data: Value = res.json().await?;
-                            check_error(&data)?;
-                            bail!("Request failed");
+                            maybe_catch_error(&data)?;
+                            bail!("Invalid response data: {data}");
                         } else {
                             let text = res.text().await?;
                             if let Some(text) = text.strip_prefix("data: ") {
@@ -190,24 +175,11 @@ async fn send_message_streaming(builder: RequestBuilder, handler: &mut ReplyHand
     Ok(())
 }
 
-fn check_error(data: &Value) -> Result<()> {
-    if let Some(err_msg) = data["error_msg"].as_str() {
-        if let Some(code) = data["error_code"].as_number().and_then(|v| v.as_u64()) {
-            if code == 110 {
-                *ACCESS_TOKEN.lock().unwrap() = None;
-            }
-            bail!("{err_msg}. err_code: {code}");
-        } else {
-            bail!("{err_msg}");
-        }
-    }
-    Ok(())
-}
-
-fn build_body(data: SendData, _model: String) -> Value {
+fn build_body(data: SendData, model: &Model) -> Value {
     let SendData {
         mut messages,
         temperature,
+        top_p,
         stream,
     } = data;
 
@@ -217,9 +189,16 @@ fn build_body(data: SendData, _model: String) -> Value {
         "messages": messages,
     });
 
-    if let Some(temperature) = temperature {
-        body["temperature"] = temperature.into();
+    if let Some(v) = model.max_output_tokens {
+        body["max_output_tokens"] = v.into();
     }
+    if let Some(v) = temperature {
+        body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
+    }
+
     if stream {
         body["stream"] = true.into();
     }

@@ -1,9 +1,10 @@
-use super::{ExtraConfig, Model, OpenAIClient, PromptType, SendData};
+use super::{
+    catch_error, ExtraConfig, Model, ModelConfig, OpenAIClient, PromptType, ReplyHandler, SendData,
+};
 
-use crate::{render::ReplyHandler, utils::PromptKind};
+use crate::utils::PromptKind;
 
 use anyhow::{anyhow, bail, Result};
-use async_trait::async_trait;
 use futures_util::StreamExt;
 use reqwest::{Client as ReqwestClient, RequestBuilder};
 use reqwest_eventsource::{Error as EventSourceError, Event, RequestBuilderExt};
@@ -12,53 +13,43 @@ use serde_json::{json, Value};
 
 const API_BASE: &str = "https://api.openai.com/v1";
 
-const MODELS: [(&str, usize, &str); 8] = [
-    // https://platform.openai.com/docs/models
-    ("gpt-3.5-turbo", 16385, "text"),
-    ("gpt-3.5-turbo-1106", 16385, "text"),
-    ("gpt-4-turbo", 128000, "text,vision"),
-    ("gpt-4-turbo-preview", 128000, "text"),
-    ("gpt-4-1106-preview", 128000, "text"),
-    ("gpt-4-vision-preview", 128000, "text,vision"),
-    ("gpt-4", 8192, "text"),
-    ("gpt-4-32k", 32768, "text"),
-];
-
 #[derive(Debug, Clone, Deserialize, Default)]
 pub struct OpenAIConfig {
     pub name: Option<String>,
     pub api_key: Option<String>,
     pub api_base: Option<String>,
     pub organization_id: Option<String>,
+    #[serde(default)]
+    pub models: Vec<ModelConfig>,
     pub extra: Option<ExtraConfig>,
 }
 
-openai_compatible_client!(OpenAIClient);
-
 impl OpenAIClient {
+    list_models_fn!(
+        OpenAIConfig,
+        [
+            // https://platform.openai.com/docs/models
+            ("gpt-3.5-turbo", "text", 16385),
+            ("gpt-3.5-turbo-1106", "text", 16385),
+            ("gpt-4-turbo", "text,vision", 128000),
+            ("gpt-4-turbo-preview", "text", 128000),
+            ("gpt-4-1106-preview", "text", 128000),
+            ("gpt-4-vision-preview", "text,vision", 128000, 4096),
+            ("gpt-4", "text", 8192),
+            ("gpt-4-32k", "text", 32768),
+        ]
+    );
     config_get_fn!(api_key, get_api_key);
     config_get_fn!(api_base, get_api_base);
 
     pub const PROMPTS: [PromptType<'static>; 1] =
         [("api_key", "API Key:", true, PromptKind::String)];
 
-    pub fn list_models(local_config: &OpenAIConfig) -> Vec<Model> {
-        let client_name = Self::name(local_config);
-        MODELS
-            .into_iter()
-            .map(|(name, max_input_tokens, capabilities)| {
-                Model::new(client_name, name)
-                    .set_capabilities(capabilities.into())
-                    .set_max_input_tokens(Some(max_input_tokens))
-            })
-            .collect()
-    }
-
     fn request_builder(&self, client: &ReqwestClient, data: SendData) -> Result<RequestBuilder> {
         let api_key = self.get_api_key()?;
         let api_base = self.get_api_base().unwrap_or_else(|_| API_BASE.to_string());
 
-        let body = openai_build_body(data, self.model.name.clone());
+        let body = openai_build_body(data, &self.model);
 
         let url = format!("{api_base}/chat/completions");
 
@@ -75,9 +66,11 @@ impl OpenAIClient {
 }
 
 pub async fn openai_send_message(builder: RequestBuilder) -> Result<String> {
-    let data: Value = builder.send().await?.json().await?;
-    if let Some(err_msg) = data["error"]["message"].as_str() {
-        bail!("{err_msg}");
+    let res = builder.send().await?;
+    let status = res.status();
+    let data: Value = res.json().await?;
+    if status != 200 {
+        catch_error(&data, status.as_u16())?;
     }
 
     let output = data["choices"][0]["message"]["content"]
@@ -106,20 +99,23 @@ pub async fn openai_send_message_streaming(
             }
             Err(err) => {
                 match err {
-                    EventSourceError::InvalidStatusCode(_, res) => {
-                        let data: Value = res.json().await?;
-                        if let Some(err_msg) = data["error"]["message"].as_str() {
-                            bail!("{err_msg}");
-                        } else if let Some(err_msg) = data["message"].as_str() {
-                            bail!("{err_msg}");
-                        } else {
-                            bail!("Request failed, {data}");
-                        }
+                    EventSourceError::InvalidStatusCode(status, res) => {
+                        let text = res.text().await?;
+                        let data: Value = match text.parse() {
+                            Ok(data) => data,
+                            Err(_) => {
+                                bail!(
+                                    "Invalid response data: {text} (status: {})",
+                                    status.as_u16()
+                                );
+                            }
+                        };
+                        catch_error(&data, status.as_u16())?;
                     }
                     EventSourceError::StreamEnded => {}
                     EventSourceError::InvalidContentType(_, res) => {
                         let text = res.text().await?;
-                        bail!("The endpoint is invalid as the response content-type is not 'text/event-stream', {text}");
+                        bail!("The API server should return data as 'text/event-stream', but it isn't. Check the client config. {text}");
                     }
                     _ => {
                         bail!("{}", err);
@@ -133,28 +129,36 @@ pub async fn openai_send_message_streaming(
     Ok(())
 }
 
-pub fn openai_build_body(data: SendData, model: String) -> Value {
+pub fn openai_build_body(data: SendData, model: &Model) -> Value {
     let SendData {
         messages,
         temperature,
+        top_p,
         stream,
     } = data;
 
     let mut body = json!({
-        "model": model,
+        "model": &model.name,
         "messages": messages,
     });
 
-    // The default max_tokens of gpt-4-vision-preview is only 16, we need to make it larger
-    if model == "gpt-4-vision-preview" {
-        body["max_tokens"] = json!(4096);
+    if let Some(v) = model.max_output_tokens {
+        body["max_tokens"] = v.into();
     }
-
     if let Some(v) = temperature {
         body["temperature"] = v.into();
+    }
+    if let Some(v) = top_p {
+        body["top_p"] = v.into();
     }
     if stream {
         body["stream"] = true.into();
     }
     body
 }
+
+impl_client_trait!(
+    OpenAIClient,
+    openai_send_message,
+    openai_send_message_streaming
+);
